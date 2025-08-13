@@ -87,6 +87,26 @@ def compute_hash(text: str) -> str:
 “”“Compute SHA1 hash of text for stable IDs.”””
 return hashlib.sha1(text.encode(“utf-8”, errors=“ignore”)).hexdigest()
 
+def sanitize_filename(text: str) -> str:
+“”“Sanitize text to be safe for use as filename.”””
+if not text:
+return “”
+
+```
+# Replace invalid characters with underscores
+invalid_chars = r'[<>:"/\\|?*\[\]]'
+sanitized = re.sub(invalid_chars, '_', text)
+
+# Remove any remaining problematic characters
+sanitized = re.sub(r'[^\w\-_.]', '_', sanitized)
+
+# Limit length and remove leading/trailing periods and spaces
+sanitized = sanitized.strip('. ')[:200]
+
+# Ensure it's not empty
+return sanitized if sanitized else compute_hash(text)
+```
+
 def clean_text(text: Optional[str]) -> str:
 “”“Clean and normalize text content.”””
 if not text:
@@ -217,7 +237,9 @@ def get_emails_needing_vectors(self, cache_dir: str) -> List[Tuple[str, str]]:
         
         results = []
         for email_id, subject, body in cursor.fetchall():
-            cache_path = Path(cache_dir) / f"{email_id}.ok"
+            # Use sanitized filename for cache
+            safe_filename = sanitize_filename(email_id)
+            cache_path = Path(cache_dir) / f"{safe_filename}.ok"
             if not cache_path.exists():
                 text = f"{subject or ''}\n\n{body or ''}".strip()
                 results.append((email_id, text))
@@ -339,7 +361,9 @@ def add_embeddings(self, vector_index: VectorIndex, texts_and_ids: List[Tuple[st
         
         # Mark as cached
         for email_id in batch_ids:
-            cache_file = Path(self.config.cache_dir) / f"{email_id}.ok"
+            # Use hash of email_id for cache filename to avoid any filename issues
+            cache_filename = compute_hash(email_id)
+            cache_file = Path(self.config.cache_dir) / f"{cache_filename}.ok"
             cache_file.touch()
 
 def search(self, vector_index: VectorIndex, query: str, k: int = 10) -> List[Tuple[str, float]]:
@@ -501,9 +525,9 @@ def _extract_email_data(self, mail) -> Optional[Dict]:
         body = self.text_processor.html_to_text(html_body) if html_body else text_body
         body = clean_text(body)
         
-        # Create stable ID
+        # Create stable ID - always use hash to ensure filename safety
         id_source = message_id.strip() or f"{subject}{sender}{sent_at or ''}".lower()
-        stable_id = message_id.strip() or compute_hash(id_source)
+        stable_id = compute_hash(id_source)
         
         return {
             "id": stable_id,
@@ -536,6 +560,61 @@ def __init__(self, config: Config, logger: logging.Logger):
     self.database = EmailDatabase(config.db_path, logger)
     self.embedding_manager = EmbeddingManager(config, logger)
     self.outlook_collector = OutlookCollector(config, logger)
+
+def cleanup_database(self):
+    """Clean up database IDs that contain invalid characters."""
+    self.logger.info("Cleaning up database IDs...")
+    
+    with self.database.get_connection() as conn:
+        cursor = conn.cursor()
+        
+        # Get all emails
+        cursor.execute("SELECT id, message_id, subject, from_addr, sent_at FROM emails")
+        all_emails = cursor.fetchall()
+        
+        updates_needed = []
+        for old_id, message_id, subject, from_addr, sent_at in all_emails:
+            # Create new clean ID using the same logic as _extract_email_data
+            id_source = message_id.strip() or f"{subject}{from_addr}{sent_at or ''}".lower()
+            new_id = compute_hash(id_source)
+            
+            if old_id != new_id:
+                updates_needed.append((new_id, old_id))
+        
+        if updates_needed:
+            self.logger.info(f"Updating {len(updates_needed)} email IDs...")
+            
+            # Update IDs in batches
+            for new_id, old_id in updates_needed:
+                try:
+                    cursor.execute("UPDATE emails SET id = ? WHERE id = ?", (new_id, old_id))
+                except sqlite3.IntegrityError:
+                    # If new_id already exists, delete the old record
+                    cursor.execute("DELETE FROM emails WHERE id = ?", (old_id,))
+            
+            conn.commit()
+            self.logger.info("Database cleanup completed")
+            
+            # Clear cache since IDs changed
+            cache_dir = Path(self.config.cache_dir)
+            if cache_dir.exists():
+                import shutil
+                shutil.rmtree(cache_dir)
+                cache_dir.mkdir(exist_ok=True)
+                self.logger.info("Cleared embedding cache")
+        else:
+            self.logger.info("No cleanup needed")
+
+def clear_cache(self):
+    """Clear the embedding cache directory."""
+    cache_dir = Path(self.config.cache_dir)
+    if cache_dir.exists():
+        import shutil
+        shutil.rmtree(cache_dir)
+        cache_dir.mkdir(exist_ok=True)
+        self.logger.info("Cleared embedding cache")
+    else:
+        self.logger.info("Cache directory does not exist")
 
 def ingest(self):
     """Ingest emails from Outlook and update search index."""
@@ -658,6 +737,30 @@ def _display_results(self, query: str, results: List[Tuple[str, float]],
         print(f"    Subject: {subject}")
         print(f"    From:    {from_addr}")
         print(f"    Preview: {body_preview}\n")
+
+    return filtered
+
+def _display_results(self, query: str, results: List[Tuple[str, float]], 
+                    emails: List[Dict]):
+    """Display search results in a formatted manner."""
+    email_map = {email["id"]: email for email in emails}
+    
+    print(f"\nTop {len(results)} results for: {query}\n")
+    
+    for rank, (email_id, score) in enumerate(results, 1):
+        email = email_map.get(email_id)
+        if not email:
+            continue
+        
+        sent_at = email.get("sent_at", "unknown")
+        subject = email.get("subject") or "(no subject)"
+        from_addr = email.get("from", "unknown")
+        body_preview = preview_text(email.get("body", ""), self.config.preview_limit)
+        
+        print(f"{rank:>2}. score={score:.3f} | {sent_at}")
+        print(f"    Subject: {subject}")
+        print(f"    From:    {from_addr}")
+        print(f"    Preview: {body_preview}\n")
 ```
 
 # ============ CLI INTERFACE ============
@@ -688,6 +791,12 @@ subparsers = parser.add_subparsers(dest="command", required=True)
 subparsers.add_parser(
     "ingest", 
     help="Collect emails from Outlook and update search index"
+)
+
+# Cleanup command
+subparsers.add_parser(
+    "cleanup",
+    help="Clean up database IDs and cache (run this if you have filename errors)"
 )
 
 # List folders command
@@ -740,6 +849,8 @@ try:
     # Execute command
     if args.command == "ingest":
         system.ingest()
+    elif args.command == "cleanup":
+        system.cleanup_database()
     elif args.command == "list-folders":
         system.outlook_collector.list_folders()
     elif args.command == "query":
